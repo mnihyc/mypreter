@@ -9,10 +9,10 @@ pub const CHANNEL_SENDWAIT_TIMEOUT: usize = 5;
 pub const CHANNEL_RECVWAIT_TIMEOUT: usize = 5;
 
 // time interval between active GetResponse packets
-pub const CHANNEL_GETRESPONSE_INTERVAL: usize = 3;
+pub const CHANNEL_GETRESPONSE_INTERVAL: usize = 5;
 
 // maximum time of inactivity before the a completed sequence is cleared
-pub const SEQUENCE_GC_INTERVAL: usize = 60;
+pub const SEQUENCE_GC_INTERVAL: usize = 5;
 
 // maximum time of inactivity before the a non-completed sequence is cleared
 pub const SEQUENCE_GC_TIMEOUT: usize = 300;

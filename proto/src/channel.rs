@@ -13,7 +13,7 @@ impl Channel {
     pub fn new(session: Arc<Session>, encrypt: Arc<dyn Encrypt>, chunk_size: usize) -> Self {
         Channel { session, encrypt, chunk_size }
     }
-
+// TODO: Add a Time Window here splitting further chunks for transmission (fitting u16) TODO: retain packets order
     pub async fn send(&self, data: Packet) -> Result<(), MyError> {
         log::debug!("Sending packet: {:?}", data);
         let mut packet = ProtoPacket::from_body(ProtoBody::Abort(ProtoAbort {}));

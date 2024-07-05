@@ -26,6 +26,7 @@ pub struct Session {
     sequence_id_cnt: Counter, // current (sent) sequence_id incrementer
     last_active: Counter, // timestamp of last activity (used in GC)
 
+    init: Counter,      // is run() initialized?
     manager: Arc<SessionManager>, // reference to session manager
     
     send_tx: async_channel::Sender<ProtoPacket>,
@@ -159,6 +160,7 @@ impl Session {
             act_client,
             sequence_id_cnt: Counter::new(0),
             last_active: Counter::new(get_timestamp()),
+            init: Counter::new(0),
             manager,
             send_tx: tx1,
             send_rx: rx1,
@@ -268,7 +270,7 @@ impl Session {
         session.activate();
         // add this to pending RequestACK queue
         session.server_send0.insert_async(packet.header.sequence_id).await.ok();
-        self.retransmission_send(packet, Arc::new(Box::new(move |packet: ProtoPacket| {
+        self.retransmission_send(vec![packet; 1], Arc::new(Box::new(move |packet: ProtoPacket| {
             let session = session.clone();
             Box::pin(async move {
                 Ok(!session.server_send0.contains_async(&packet.header.sequence_id).await)
@@ -287,7 +289,34 @@ impl Session {
         }
         self.activate();
         self.server_send0.insert_async(sequence_id).await.ok();
-        Ok(())
+        // in tcp/udp protocols, session.sender is not a dummy function
+        // we can directly issue Response/PullResponse here to reduce interaction latency
+        {
+            // V same as on_recv GetResponse V
+            let sequence = self.get_sequence(false, sequence_id).await?;
+            let sequence = sequence.read().await;
+            if sequence.total == 0 {
+                // sequence may already be removed by another thread
+                return Ok(());
+            }
+            if sequence.total == 1 {
+                // packet is small enough; allow direct PullResponse
+                let data = sequence.fragments[0].data.clone();
+                let reply = self.with_packet_sid(ProtoPacket::from_body(
+                    ProtoBody::PullResponse(ProtoPullResponse { data })
+                ), sequence_id);
+                (self.sender)(reply).await.ok(); // do not go through self.send()
+                return Ok(());
+            } else {
+                // fragmentation required
+                let frame_count = sequence.total;
+                let reply = self.with_packet_sid(ProtoPacket::from_body(
+                    ProtoBody::Response(ProtoResponse { frame_count })
+                ), sequence_id);
+                (self.sender)(reply).await.ok(); // do not go through self.send()
+                return Ok(());
+            }
+        }
     }
 
     /// call this function to actively receive a sequence data
@@ -359,6 +388,11 @@ impl Session {
         }
         self.worker_threads.set(workers);
 
+        if self.init.get() > 0 {
+            return;
+        }
+        self.init.set(1);
+
         // a keepalive recving task for clients
         if self.is_client() {
             tokio::spawn({
@@ -393,11 +427,28 @@ impl Session {
                         session.manager.close_session(session.session_id).await;
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(SEQUENCE_GC_TIMEOUT as u64)).await;
-                    session.sequences0.retain_async(|_, sequence| {
-                        let sequence = sequence.blocking_read();
-                        sequence.last_active + (SEQUENCE_GC_INTERVAL as u32) >= get_timestamp() as u32
-                    }).await;
+                    tokio::time::sleep(Duration::from_secs(SEQUENCE_GC_INTERVAL as u64)).await;
+                    let clean = move |sequences: HashMap<u16, Arc<RwLock<Sequence>>>| {
+                        async move {
+                            let mut sids = Vec::new();
+                            sequences.scan_async(|sid, _| {
+                                sids.push(*sid);
+                            }).await;
+                            log::warn!("GC awaiting sequences: {:?}", sids);
+                            for sid in sids {
+                                log::warn!("GC checking sequence: {:?}", sid);
+                                let sequence = sequences.get_async(&sid).await.unwrap();
+                                let sequence = sequence.read().await;
+                                if (sequence.last_active + (SEQUENCE_GC_TIMEOUT as u32) < get_timestamp() as u32) || sequence.total == 0
+                                 || (sequence.total == 1 && sequence.received >= 1 && sequence.last_active + (SEQUENCE_GC_INTERVAL as u32) < get_timestamp() as u32) {
+                                    drop(sequence); // release the lock
+                                    sequences.remove_async(&sid).await;
+                                }
+                            }
+                        }
+                    };
+                    clean(session.sequences0.clone()).await;
+                    clean(session.sequences1.clone()).await;
                 }
             }
         });
@@ -424,8 +475,7 @@ impl Session {
         let sequence = self.get_sequence_or_create(aop, sequence_id).await;
         let mut sequence = sequence.write().await;
         if sequence.total != 0 {
-            log::warn!("Packet sequence collision (network lag?): {:?}", frame_count);
-            sequence.gc();
+            return Err(MyError::InvalidPacket("Packet sequence collision".to_string()));
         }
         sequence.total = frame_count;
         sequence.fragments = (0..sequence.total).map(|_| Fragment::new()).collect();
@@ -487,13 +537,7 @@ impl Session {
         };
 
         if let Some(data) = ext_data {
-            tokio::spawn({
-                let session = self.session().await?;
-                async move {
-                    tokio::time::sleep(Duration::from_secs(SEQUENCE_GC_INTERVAL as u64)).await;
-                    session.remove_sequence(aop, packet.header.sequence_id).await;
-                }
-            });
+            // GC is done in initially spawned task
             self.recv_tx.send(data).await.ok();
         }
 
@@ -532,6 +576,7 @@ impl Session {
                     // safe to remove from sequences?
                     session.remove_sequence(false, packet.header.sequence_id).await;
                     session.server_send1.remove_async(&packet.header.sequence_id).await;
+                    session.server_send0.remove_async(&packet.header.sequence_id).await;
                 }
 
                 // GetResponse does not require a valid sequence id
@@ -617,30 +662,32 @@ impl Session {
                 }
                 let sequence = session.get_sequence(true, packet.header.sequence_id).await?;
                 let sequence = sequence.read().await;
+                let mut packets = Vec::new();
                 for i in 0..sequence.total {
                     let packet = ProtoPacket::from(ProtoHeader {
                         fragment_offset: i,
                         ..packet.header.clone()
                     }, ProtoBody::Push(ProtoPush { data: sequence.fragments[i as usize].data.clone() }));
-                    let session1 = session.clone();
-                    self.retransmission_send(packet, Arc::new(Box::new(move |packet: ProtoPacket| {
-                        let session = session1.clone();
-                        Box::pin(async move {
-                            let sequence = session.get_sequence(true, packet.header.sequence_id).await?;
-                            // either it's removed; or not fully acked
-                            let sequence = sequence.read().await;
-                            if sequence.fragments.len() <= packet.header.fragment_offset as usize {
-                                // fragment out of range; retransmit
-                                return Err(MyError::InvalidPacket("Fragment ID out of range".to_string()));
-                            }
-                            if sequence.fragments[packet.header.fragment_offset as usize].data.len() == 0 {
-                                // fragment already acked
-                                return Ok(true);
-                            }
-                            Ok(false)
-                        }) as AsyncFuture<Result<bool, MyError>>
-                    }))).await?;
+                    packets.push(packet);
                 }
+                let session1 = session.clone();
+                self.retransmission_send(packets, Arc::new(Box::new(move |packet: ProtoPacket| {
+                    let session = session1.clone();
+                    Box::pin(async move {
+                        let sequence = session.get_sequence(true, packet.header.sequence_id).await?;
+                        // either it's removed; or not fully acked
+                        let sequence = sequence.read().await;
+                        if sequence.fragments.len() <= packet.header.fragment_offset as usize {
+                            // fragment out of range; retransmit
+                            return Err(MyError::InvalidPacket("Fragment ID out of range".to_string()));
+                        }
+                        if sequence.fragments[packet.header.fragment_offset as usize].data.len() == 0 {
+                            // fragment already acked
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    }) as AsyncFuture<Result<bool, MyError>>
+                }))).await?;
             },
 
             ProtoBody::PushACK(data) => {
@@ -660,6 +707,7 @@ impl Session {
                 }
                 if sequence.received == sequence.total {
                     // packet is fully sent and acked; remove directly
+                    sequence.gc();
                     session.remove_sequence(true, packet.header.sequence_id).await;
                 }
             },
@@ -671,42 +719,47 @@ impl Session {
 
             ProtoBody::Response(data) => {
                 self.expect_client()?;
-                self.new_sequence(false, packet.header.sequence_id, data.frame_count).await?;
+                if self.new_sequence(false, packet.header.sequence_id, data.frame_count).await.is_err() {
+                    // either invalid data or this is a duplicated packet; ignore
+                    return Ok(None)
+                }
                 if session.server_send1.insert_async(packet.header.sequence_id).await.is_err() {
                     // duplicated Response packet; another task is handling this
                     return Ok(None)
                 }
+                let mut packets = Vec::new();
                 for i in 0..data.frame_count {
                     let packet = ProtoPacket::from(ProtoHeader {
                         fragment_offset: i,
                         ..packet.header.clone()
                     }, ProtoBody::Pull(ProtoPull {}));
-                    let session1 = session.clone();
-                    self.retransmission_send(packet, Arc::new(Box::new(move |packet: ProtoPacket| {
-                        let session = session1.clone();
-                        Box::pin(async move {
-                            let sequence = session.get_sequence(false, packet.header.sequence_id).await?;
-                            let sequence = sequence.read().await;
-                            if sequence.total == 0 {
-                                // sequence may already be removed by another thread
-                                return Ok(true);
-                            }
-                            if sequence.total == 1 && sequence.received >= sequence.total {
-                                // packet is fully received and reconstructed
-                                return Ok(true);
-                            }
-                            if sequence.fragments.len() <= packet.header.fragment_offset as usize {
-                                // fragment out of range; retransmit
-                                return Err(MyError::InvalidPacket("Fragment ID out of range".to_string()));
-                            }
-                            if sequence.fragments[packet.header.fragment_offset as usize].data.len() == 0 {
-                                // fragment not acked; retransmit
-                                return Ok(false);
-                            }
-                            Ok(true)
-                        }) as AsyncFuture<Result<bool, MyError>>
-                    }))).await?;
+                    packets.push(packet);
                 }
+                let session1 = session.clone();
+                self.retransmission_send(packets, Arc::new(Box::new(move |packet: ProtoPacket| {
+                    let session = session1.clone();
+                    Box::pin(async move {
+                        let sequence = session.get_sequence(false, packet.header.sequence_id).await?;
+                        let sequence = sequence.read().await;
+                        if sequence.total == 0 {
+                            // sequence may already be removed by another thread
+                            return Ok(true);
+                        }
+                        if sequence.total == 1 && sequence.received >= sequence.total {
+                            // packet is fully received and reconstructed
+                            return Ok(true);
+                        }
+                        if sequence.fragments.len() <= packet.header.fragment_offset as usize {
+                            // fragment out of range; retransmit
+                            return Err(MyError::InvalidPacket("Fragment ID out of range".to_string()));
+                        }
+                        if sequence.fragments[packet.header.fragment_offset as usize].data.len() == 0 {
+                            // fragment not acked; retransmit
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    }) as AsyncFuture<Result<bool, MyError>>
+                }))).await?;
             },
 
             ProtoBody::PullResponse(data) => {
@@ -730,37 +783,48 @@ impl Session {
         Ok(None)
     }
 
-    pub async fn retransmission_send(&self, packet: ProtoPacket, cond: RetrCond) -> Result<(), MyError> {
+    pub async fn retransmission_send(&self, packets: Vec<ProtoPacket>, cond: RetrCond) -> Result<(), MyError> {
         // it's very unlikely to encounter hash collision; but if it does, it's okay to ignore
-        self.retr_map.insert_async(packet.get_hash()).await.ok();
-        self.send(packet.clone()).await?;
+        for packet in packets.clone() {
+            self.retr_map.insert_async(packet.get_hash()).await.ok();
+            self.send(packet.clone()).await?;
+        }
         tokio::spawn({
             let session = self.session().await?;
-            let mut packet = packet;
+            let mut packets = packets.clone();
             async move {
-                loop {
+                'outer: loop {
+                    if packets.len() == 0 {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_secs(CHANNEL_RECVWAIT_TIMEOUT as u64)).await;
-                    match (cond)(packet.clone()).await {
-                        Ok(true) => break,
-                        Ok(false) => {
-                            // considered lost; retransmit
-                            if !session.retr_map.contains_async(&packet.get_hash()).await {
-                                // sent and not acked; maybe lost
-                                packet = ProtoPacket::from(packet.header, packet.body.clone());
-                                session.retr_map.insert_async(packet.get_hash()).await.ok();
-                                if session.send(packet.clone()).await.is_err() {
-                                    break;
+                    let mut packets1 = Vec::new();
+                    for packet in packets.iter() {
+                        match (cond)(packet.clone()).await {
+                            Ok(true) => {},
+                            Ok(false) => {
+                                // considered lost; retransmit
+                                if !session.retr_map.contains_async(&packet.get_hash()).await {
+                                    // sent and not acked; maybe lost
+                                    let packet = ProtoPacket::from(packet.header, packet.body.clone());
+                                    packets1.push(packet.clone());
+                                    session.retr_map.insert_async(packet.get_hash()).await.ok();
+                                    if session.send(packet.clone()).await.is_err() {
+                                        break 'outer;
+                                    }
+                                } else {
+                                    // havn't been actually sent; we must avoid flooding the sending queue
+                                    packets1.push(packet.clone());
+                                    continue;
                                 }
-                            } else {
-                                // havn't been actually sent; we must avoid flooding the sending queue
-                                continue;
+                            },
+                            Err(e) => {
+                                log::warn!("Failed to retransmit packet: {:?}", e);
+                                break 'outer;
                             }
-                        },
-                        Err(e) => {
-                            log::warn!("Failed to retransmit packet: {:?}", e);
-                            break;
                         }
                     }
+                    packets = packets1;
                 }
             }
         });
