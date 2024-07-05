@@ -428,27 +428,28 @@ impl Session {
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(SEQUENCE_GC_INTERVAL as u64)).await;
-                    let clean = move |sequences: HashMap<u16, Arc<RwLock<Sequence>>>| {
+                    let clean = move |aop, session: Arc<Session>| {
                         async move {
+                            let sequences = if aop { &session.sequences0 } else { &session.sequences1 };
                             let mut sids = Vec::new();
                             sequences.scan_async(|sid, _| {
                                 sids.push(*sid);
                             }).await;
-                            log::warn!("GC awaiting sequences: {:?}", sids);
                             for sid in sids {
-                                log::warn!("GC checking sequence: {:?}", sid);
-                                let sequence = sequences.get_async(&sid).await.unwrap();
+                                let sequence = match sequences.get_async(&sid).await {
+                                    None => continue,
+                                    Some(sequence) => sequence.clone(),
+                                };
                                 let sequence = sequence.read().await;
                                 if (sequence.last_active + (SEQUENCE_GC_TIMEOUT as u32) < get_timestamp() as u32) || sequence.total == 0
                                  || (sequence.total == 1 && sequence.received >= 1 && sequence.last_active + (SEQUENCE_GC_INTERVAL as u32) < get_timestamp() as u32) {
-                                    drop(sequence); // release the lock
                                     sequences.remove_async(&sid).await;
                                 }
                             }
                         }
                     };
-                    clean(session.sequences0.clone()).await;
-                    clean(session.sequences1.clone()).await;
+                    clean(true, session.clone()).await;
+                    clean(false, session.clone()).await;
                 }
             }
         });
@@ -634,7 +635,7 @@ impl Session {
             ProtoBody::Pull(_) => {
                 self.expect_server()?;
                 // client should have known the existence of the sequence; remove from server_send1
-                session.server_send1.remove(&packet.header.sequence_id);
+                session.server_send1.remove_async(&packet.header.sequence_id).await;
 
                 let sequence = session.get_sequence(false, packet.header.sequence_id).await?;
                 let sequence = sequence.read().await;
@@ -674,11 +675,14 @@ impl Session {
                 self.retransmission_send(packets, Arc::new(Box::new(move |packet: ProtoPacket| {
                     let session = session1.clone();
                     Box::pin(async move {
-                        let sequence = session.get_sequence(true, packet.header.sequence_id).await?;
+                        let sequence = match session.get_sequence(true, packet.header.sequence_id).await {
+                            Ok(sequence) => sequence,
+                            Err(_) => return Ok(true),
+                        };
                         // either it's removed; or not fully acked
                         let sequence = sequence.read().await;
                         if sequence.fragments.len() <= packet.header.fragment_offset as usize {
-                            // fragment out of range; retransmit
+                            // fragment out of range; should exit
                             return Err(MyError::InvalidPacket("Fragment ID out of range".to_string()));
                         }
                         if sequence.fragments[packet.header.fragment_offset as usize].data.len() == 0 {
@@ -739,7 +743,10 @@ impl Session {
                 self.retransmission_send(packets, Arc::new(Box::new(move |packet: ProtoPacket| {
                     let session = session1.clone();
                     Box::pin(async move {
-                        let sequence = session.get_sequence(false, packet.header.sequence_id).await?;
+                        let sequence = match session.get_sequence(false, packet.header.sequence_id).await {
+                            Ok(sequence) => sequence,
+                            Err(_) => return Ok(true),
+                        };
                         let sequence = sequence.read().await;
                         if sequence.total == 0 {
                             // sequence may already be removed by another thread
@@ -869,7 +876,7 @@ impl Sequence {
             return Err(MyError::InvalidPacket("Too many fragments".to_string()));
         }
         self.total = fragments.len() as u16;
-        self.received = self.total;
+        self.received = 0;
         self.fragments = fragments;
         Ok(())
     }
