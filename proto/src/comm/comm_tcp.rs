@@ -107,9 +107,10 @@ impl TcpContext {
         let rstream1 = rstream.clone();
         let wstream = Arc::new(Mutex::new(wstream));
         let wstream1 = wstream.clone();
-        let sender = Arc::new(Box::new(move |packet: ProtoPacket| {
+        let sender = Arc::new(Box::new(move |args: (ProtoPacket, u16)| {
             let wstream = wstream1.clone();
             Box::pin(async move {
+                let (packet, _) = args;
                 log::debug!("Sending packet: {:?}", packet);
                 let mut wstream = wstream.lock().await;
                 let data = packet.serialize()?;
@@ -132,14 +133,14 @@ impl TcpContext {
             let manager = manager1.clone();
             let sender = sender1.clone();
             Box::pin(async move {
-                manager.create_session(manager.clone(), sender, is_client, None, param.workers).await
+                manager.create_session(manager.clone(), sender, is_client, 0, param.workers).await
             }) as AsyncFuture<Arc<Session>>
         }));
 
         let session;
         if self.is_client {
             let sid = handshake_client((rstream, wstream), self.encrypt.clone()).await?;
-            session = self.manager.create_session(self.manager.clone(), sender, self.is_client, Some(sid), self.param.workers).await;
+            session = self.manager.create_session(self.manager.clone(), sender, self.is_client, sid, self.param.workers).await;
             log::info!("Created session {}", session.get_id());
         } else {
             session = handshake_server((rstream, wstream), self.encrypt.clone(), get_session).await?;
@@ -149,6 +150,7 @@ impl TcpContext {
         let manager1 = self.manager.clone();
         let rstream = rstream1.clone();
         let session_id = session.get_id();
+        let remote_session_id = session.get_remote_id();
         tokio::spawn(async move {
             loop {
                 let mut buf = [0; 4];
@@ -164,14 +166,14 @@ impl TcpContext {
                     break;
                 }
                 if let Ok(packet) = ProtoPacket::deserialize(&data) {
-                    match manager1.on_recv(packet).await {
+                    match manager1.on_recv(packet, session_id).await {
                         Err(e) => {
                             log::error!("Failed to handle packet: {}", e);
                             break;
                         },
                         Ok(reply) => {
                             if let Some(reply) = reply {
-                                if let Err(e) = sender2(reply).await {
+                                if let Err(e) = sender2((reply, remote_session_id)).await {
                                     log::error!("Failed to send reply packet: {}", e);
                                     break;
                                 }

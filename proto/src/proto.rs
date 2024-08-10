@@ -16,7 +16,7 @@ use crate::{error::MyError, utils::get_timestamp};
 * Msg Type: enum ProtoType
 * Fragment Offset: fragment delimiting hint.
 * Session ID: session identifier (allocated by server in channel handshake)
-* Sequence ID: sequence identifier (incremented by client in each packet)
+* Sequence ID: sequence identifier (incremented by client/server separately in each packet)
 * Timestamp: timestamp of the message (sent)
 */
 
@@ -61,7 +61,7 @@ pub struct ProtoHeader {
     pub version: u8,
     //msg_type: ProtoType, // serialized in body
     pub fragment_offset: u16,
-    pub session_id: u16,
+    //pub session_id: u16, // implemented by comm_
     pub sequence_id: u16,
     pub timestamp: u32,
 }
@@ -157,7 +157,6 @@ impl ProtoPacket {
             header: ProtoHeader {
                 version: 1,
                 fragment_offset: 0,
-                session_id: 0,
                 sequence_id: 0,
                 timestamp: get_timestamp() as u32,
             },

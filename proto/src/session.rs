@@ -18,10 +18,11 @@ pub struct SessionManager {
     sessions: Arc<HashMap<u16, Arc<Session>>>,
 }
 
-type Sender = AsyncFn<ProtoPacket, Result<(), MyError>>;
+type Sender = AsyncFn<(ProtoPacket, u16), Result<(), MyError>>;
 
 pub struct Session {
     session_id: u16,      // my session_id
+    remote_session_id: u16, // remote session_id (required by clients)
     act_client: bool,     // true if this session is a client actor
     sequence_id_cnt: Counter, // current (sent) sequence_id incrementer
     last_active: Counter, // timestamp of last activity (used in GC)
@@ -81,14 +82,9 @@ impl SessionManager {
     }
 
     /// Arc<SessionManager> is a self-reference obtained from owner (required by Rust)
-    pub async fn create_session(&self, manager: Arc<SessionManager>, sender: Sender, act_client: bool, session_id: Option<u16>, workers: Option<usize>) -> Arc<Session> {
-        let session_id = {
-            match session_id {
-                Some(session_id) => session_id,
-                None => self.session_id_cnt.increment() as u16,
-            }
-        };
-        let session = Arc::new(Session::new(session_id, act_client, sender, manager));
+    pub async fn create_session(&self, manager: Arc<SessionManager>, sender: Sender, act_client: bool, remote_session_id: u16, workers: Option<usize>) -> Arc<Session> {
+        let session_id = self.session_id_cnt.increment() as u16;
+        let session = Arc::new(Session::new(session_id, remote_session_id, act_client, sender, manager));
         if self.sessions.insert_async(session_id, session.clone()).await.is_err() {
             log::warn!("Session ID collision detected: {}", session_id);
             log::warn!("?Under DoS attack?");
@@ -103,9 +99,9 @@ impl SessionManager {
             tokio::spawn(async move {
                 session.1.gc();
                 // notify the other end
-                let _ = (session.1.sender)(session.1.with_packet(
+                let _ = (session.1.sender)((session.1.with_packet(
                     ProtoPacket::from_body(ProtoBody::Abort(ProtoAbort {}))
-                )).await.ok();
+                ), session.1.remote_session_id)).await.ok();
             });
         }
     }
@@ -131,9 +127,9 @@ impl SessionManager {
     /// 
     /// for clients, it triggers wait_channel for state transitions.
     /// for servers, the returned packet should be responded by the caller.
-    pub async fn on_recv(&self, packet: ProtoPacket) -> Result<Option<ProtoPacket>, MyError> {
+    pub async fn on_recv(&self, packet: ProtoPacket, session_id: u16) -> Result<Option<ProtoPacket>, MyError> {
         log::debug!("Received packet: {:?}", packet);
-        match self.get_session(packet.header.session_id).await {
+        match self.get_session(session_id).await {
             None => {
                 log::warn!("Dropping packet due to unknown session: {:?}", packet);
             }
@@ -151,12 +147,13 @@ impl SessionManager {
 type RetrCond = AsyncFn<ProtoPacket, Result<bool, MyError>>;
 
 impl Session {
-    pub fn new(session_id: u16, act_client: bool, sender: Sender, manager: Arc<SessionManager>) -> Self {
+    pub fn new(session_id: u16, remote_session_id: u16, act_client: bool, sender: Sender, manager: Arc<SessionManager>) -> Self {
         let (tx, rx) = async_channel::unbounded();
         let (tx1, rx1) = async_channel::unbounded();
         let (tx2, rx2) = async_channel::bounded(1);
         Self {
             session_id,
+            remote_session_id,
             act_client,
             sequence_id_cnt: Counter::new(0),
             last_active: Counter::new(get_timestamp()),
@@ -205,13 +202,16 @@ impl Session {
         self.session_id
     }
 
+    pub fn get_remote_id(&self) -> u16 {
+        self.remote_session_id
+    }
+
     pub fn with_packet(&self, packet: ProtoPacket) -> ProtoPacket {
         self.with_packet_sid(packet, self.sequence_id_cnt.increment() as u16)
     }
 
     pub fn with_packet_sid(&self, packet: ProtoPacket, sequence_id: u16) -> ProtoPacket {
         let mut packet = packet;
-        packet.header.session_id = self.session_id;
         packet.header.sequence_id = sequence_id;
         packet.header.timestamp = get_timestamp() as u32;
         packet
@@ -305,7 +305,7 @@ impl Session {
                 let reply = self.with_packet_sid(ProtoPacket::from_body(
                     ProtoBody::PullResponse(ProtoPullResponse { data })
                 ), sequence_id);
-                (self.sender)(reply).await.ok(); // do not go through self.send()
+                (self.sender)((reply, self.remote_session_id)).await.ok(); // do not go through self.send()
                 return Ok(());
             } else {
                 // fragmentation required
@@ -313,7 +313,7 @@ impl Session {
                 let reply = self.with_packet_sid(ProtoPacket::from_body(
                     ProtoBody::Response(ProtoResponse { frame_count })
                 ), sequence_id);
-                (self.sender)(reply).await.ok(); // do not go through self.send()
+                (self.sender)((reply, self.remote_session_id)).await.ok(); // do not go through self.send()
                 return Ok(());
             }
         }
@@ -353,15 +353,10 @@ impl Session {
                             }
                             packet.header.timestamp = get_timestamp() as u32;
 
-                            if packet.header.session_id != session.session_id {
-                                log::warn!("Sending packets in wrong session channel?: {:?}", packet);
-                                continue;
-                            }
-
                             // mark as actually sent
                             session.retr_map.remove_async(&packet.get_hash()).await;
 
-                            match (session.sender)(packet.clone()).await {
+                            match (session.sender)((packet.clone(), session.remote_session_id)).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     // Explicit error; simply retransmit (may cause overload)
@@ -369,7 +364,7 @@ impl Session {
                                     match e {
                                         MyError::Disconnected(_) => {
                                             // session closed; need to be re-established
-                                            manager.close_session(packet.header.session_id).await;
+                                            manager.close_session(session.session_id).await;
                                         }
                                         _ => {
                                             // retransmit
@@ -723,12 +718,12 @@ impl Session {
 
             ProtoBody::Response(data) => {
                 self.expect_client()?;
-                if self.new_sequence(false, packet.header.sequence_id, data.frame_count).await.is_err() {
-                    // either invalid data or this is a duplicated packet; ignore
-                    return Ok(None)
-                }
                 if session.server_send1.insert_async(packet.header.sequence_id).await.is_err() {
                     // duplicated Response packet; another task is handling this
+                    return Ok(None)
+                }
+                if self.new_sequence(false, packet.header.sequence_id, data.frame_count).await.is_err() {
+                    // either invalid data or this is a duplicated packet; ignore
                     return Ok(None)
                 }
                 let mut packets = Vec::new();
@@ -783,7 +778,7 @@ impl Session {
 
             /* abort */
             ProtoBody::Abort(_) => {
-                self.manager.close_session(packet.header.session_id).await;
+                self.manager.close_session(self.session_id).await;
             },
             
         }
